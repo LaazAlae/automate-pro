@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: document-processor
+    env: python
+    buildCommand: pip install -r requirements-new.txt
+    startCommand: gunicorn main:app
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: PYTHON_VERSION
+        value: 3.11.0
