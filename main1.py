@@ -7,16 +7,8 @@ import logging
 from difflib import get_close_matches
 from werkzeug.utils import secure_filename
 from flask import Flask, render_template_string, request, jsonify, send_file, session
+import fitz
 import pandas as pd
-try:
-    import PyPDF2 as pdf_lib
-    PDF_LIB = 'pypdf2'
-except ImportError:
-    try:
-        import fitz
-        PDF_LIB = 'pymupdf'
-    except ImportError:
-        PDF_LIB = None
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'change-this-in-production')
@@ -33,33 +25,13 @@ logging.basicConfig(level=logging.INFO)
 def safe_filename(filename):
     return secure_filename(filename)
 
-def validate_pdf_pypdf2(file_path):
-    try:
-        with open(file_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            if len(reader.pages) > 0:
-                first_page = reader.pages[0]
-                text = first_page.extract_text()
-                return len(text.strip()) > 0
-        return False
-    except:
-        return False
-
-def validate_pdf_pymupdf(file_path):
+def validate_pdf(file_path):
     try:
         doc = fitz.open(file_path)
         has_text = any(page.get_text().strip() for page in doc)
         doc.close()
         return has_text
     except:
-        return False
-
-def validate_pdf(file_path):
-    if PDF_LIB == 'pypdf2':
-        return validate_pdf_pypdf2(file_path)
-    elif PDF_LIB == 'pymupdf':
-        return validate_pdf_pymupdf(file_path)
-    else:
         return False
 
 @app.route('/')
@@ -193,59 +165,7 @@ def download_file(filename):
         return send_file(file_path, as_attachment=True)
     return jsonify({'error': 'File not found'}), 404
 
-def process_statements_pypdf2(pdf_path, excel_path):
-    df = pd.read_excel(excel_path)
-    company_names = df.iloc[:, 0].dropna().tolist()
-    
-    categories = {'dnm': [], 'national_single': [], 'national_multi': [], 'foreign': []}
-    pending_decisions = []
-    
-    start_markers = ["914.949.9618", "302.703.8961", "www.unitedcorporate.com", "AR@UNITEDCORPORATE.COM"]
-    end_marker = "STATEMENT OF OPEN INVOICE(S)"
-    
-    with open(pdf_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        
-        for page_num, page in enumerate(reader.pages):
-            text = page.extract_text()
-            
-            page_match = re.search(r'Page\s*(\d+)\s*of\s*(\d+)', text, re.IGNORECASE)
-            total_pages = int(page_match.group(2)) if page_match else 1
-            
-            start_idx = min((text.find(marker) for marker in start_markers if text.find(marker) != -1), default=-1)
-            end_idx = text.find(end_marker)
-            
-            if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-                extracted_text = text[start_idx:end_idx].strip()
-                lines = [line.strip() for line in extracted_text.splitlines() if line.strip()]
-                
-                if lines:
-                    company_name = lines[0]
-                    pages = [page_num + 1]  # PyPDF2 processes page by page
-                    
-                    if company_name in company_names:
-                        categories['dnm'].extend(pages)
-                    else:
-                        close_matches = get_close_matches(company_name, company_names, n=1, cutoff=0.8)
-                        if close_matches:
-                            pending_decisions.append({
-                                'page_num': page_num + 1,
-                                'company_name': company_name,
-                                'close_match': close_matches[0],
-                                'total_pages': 1,
-                                'lines': lines[:5]
-                            })
-                        else:
-                            if "email" in text.lower():
-                                categories['dnm'].extend(pages)
-                            elif any(state in ' '.join(lines[1:]) for state in US_STATES):
-                                categories['national_single'].extend(pages)
-                            else:
-                                categories['foreign'].extend(pages)
-                                
-    return {'categories': categories, 'pending_decisions': pending_decisions}
-
-def process_statements_pymupdf(pdf_path, excel_path):
+def process_statements(pdf_path, excel_path):
     df = pd.read_excel(excel_path)
     company_names = df.iloc[:, 0].dropna().tolist()
     
@@ -303,37 +223,7 @@ def process_statements_pymupdf(pdf_path, excel_path):
     doc.close()
     return {'categories': categories, 'pending_decisions': pending_decisions}
 
-def process_statements(pdf_path, excel_path):
-    if PDF_LIB == 'pypdf2':
-        return process_statements_pypdf2(pdf_path, excel_path)
-    elif PDF_LIB == 'pymupdf':
-        return process_statements_pymupdf(pdf_path, excel_path)
-    else:
-        raise Exception("No PDF library available")
-
-def create_statement_pdfs_pypdf2(pdf_path, categories):
-    files = []
-    
-    with open(pdf_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        
-        for name, pages in categories.items():
-            if pages:
-                writer = PyPDF2.PdfWriter()
-                for page_num in sorted(set(pages)):
-                    if 0 <= page_num - 1 < len(reader.pages):
-                        writer.add_page(reader.pages[page_num - 1])
-                        
-                if len(writer.pages) > 0:
-                    filename = f"{name}.pdf"
-                    file_path = os.path.join(RESULTS_FOLDER, filename)
-                    with open(file_path, 'wb') as output_file:
-                        writer.write(output_file)
-                    files.append(filename)
-                    
-    return files
-
-def create_statement_pdfs_pymupdf(pdf_path, categories):
+def create_statement_pdfs(pdf_path, categories):
     doc = fitz.open(pdf_path)
     files = []
     
@@ -354,33 +244,7 @@ def create_statement_pdfs_pymupdf(pdf_path, categories):
     doc.close()
     return files
 
-def create_statement_pdfs(pdf_path, categories):
-    if PDF_LIB == 'pypdf2':
-        return create_statement_pdfs_pypdf2(pdf_path, categories)
-    elif PDF_LIB == 'pymupdf':
-        return create_statement_pdfs_pymupdf(pdf_path, categories)
-    else:
-        raise Exception("No PDF library available")
-
-def extract_invoices_pypdf2(pdf_path):
-    pattern = r'\b[PR]\d{6,8}\b'
-    invoices = {}
-    
-    with open(pdf_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        
-        for page_num, page in enumerate(reader.pages):
-            text = page.extract_text()
-            invoice_numbers = re.findall(pattern, text)
-            
-            for invoice_number in invoice_numbers:
-                if invoice_number not in invoices:
-                    invoices[invoice_number] = []
-                invoices[invoice_number].append(page_num)
-                
-    return invoices
-
-def extract_invoices_pymupdf(pdf_path):
+def extract_invoices(pdf_path):
     doc = fitz.open(pdf_path)
     pattern = r'\b[PR]\d{6,8}\b'
     invoices = {}
@@ -398,36 +262,7 @@ def extract_invoices_pymupdf(pdf_path):
     doc.close()
     return invoices
 
-def extract_invoices(pdf_path):
-    if PDF_LIB == 'pypdf2':
-        return extract_invoices_pypdf2(pdf_path)
-    elif PDF_LIB == 'pymupdf':
-        return extract_invoices_pymupdf(pdf_path)
-    else:
-        raise Exception("No PDF library available")
-
-def create_invoice_zip_pypdf2(pdf_path, invoices):
-    zip_path = os.path.join(RESULTS_FOLDER, 'invoices.zip')
-    
-    with open(pdf_path, 'rb') as file:
-        reader = PyPDF2.PdfReader(file)
-        
-        with zipfile.ZipFile(zip_path, 'w') as zipf:
-            for invoice_number, pages in invoices.items():
-                writer = PyPDF2.PdfWriter()
-                for page_num in pages:
-                    writer.add_page(reader.pages[page_num])
-                    
-                if len(writer.pages) > 0:
-                    temp_path = f"/tmp/{invoice_number}.pdf"
-                    with open(temp_path, 'wb') as temp_file:
-                        writer.write(temp_file)
-                    zipf.write(temp_path, f"{invoice_number}.pdf")
-                    os.remove(temp_path)
-                    
-    return zip_path
-
-def create_invoice_zip_pymupdf(pdf_path, invoices):
+def create_invoice_zip(pdf_path, invoices):
     doc = fitz.open(pdf_path)
     zip_path = os.path.join(RESULTS_FOLDER, 'invoices.zip')
     
@@ -446,14 +281,6 @@ def create_invoice_zip_pymupdf(pdf_path, invoices):
             
     doc.close()
     return zip_path
-
-def create_invoice_zip(pdf_path, invoices):
-    if PDF_LIB == 'pypdf2':
-        return create_invoice_zip_pypdf2(pdf_path, invoices)
-    elif PDF_LIB == 'pymupdf':
-        return create_invoice_zip_pymupdf(pdf_path, invoices)
-    else:
-        raise Exception("No PDF library available")
 
 HOME_TEMPLATE = '''
 <!DOCTYPE html>
@@ -565,15 +392,14 @@ HOME_TEMPLATE = '''
                 if (inputIds.length === 1) {
                     document.getElementById(inputIds[0]).click();
                 } else {
-                    // For multiple files, cycle through them
-                    let currentInput = 0;
-                    const clickNext = () => {
-                        if (currentInput < inputIds.length) {
-                            document.getElementById(inputIds[currentInput]).click();
-                            currentInput++;
-                        }
-                    };
-                    clickNext();
+                    // For multiple files, show selection
+                    const select = document.createElement('select');
+                    select.innerHTML = `
+                        <option value="${inputIds[0]}">Select PDF file</option>
+                        <option value="${inputIds[1]}">Select Excel file</option>
+                    `;
+                    select.onchange = () => document.getElementById(select.value).click();
+                    select.click();
                 }
             });
             
@@ -615,15 +441,12 @@ HOME_TEMPLATE = '''
                 return input.files[0] ? input.files[0].name : null;
             }).filter(Boolean);
             
-            if (inputIds.length === 1 && files.length > 0) {
-                fileInfo.textContent = files[0];
-                btn.disabled = false;
-            } else if (inputIds.length === 2 && files.length === 2) {
+            if (files.length > 0) {
                 fileInfo.textContent = files.join(', ');
                 btn.disabled = false;
             } else {
-                fileInfo.textContent = files.join(', ') + (inputIds.length === 2 && files.length === 1 ? ' (need both PDF and Excel)' : '');
-                btn.disabled = inputIds.length === 2 ? files.length !== 2 : files.length === 0;
+                fileInfo.textContent = '';
+                btn.disabled = true;
             }
         }
         

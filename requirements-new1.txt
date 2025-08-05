@@ -1,6 +1,6 @@
 Flask==3.0.3
+PyMuPDF==1.23.26
 pandas==2.2.2
 openpyxl==3.1.5
 Werkzeug==3.0.3
 gunicorn==21.2.0
-PyPDF2==3.0.1
