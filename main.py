@@ -7,16 +7,8 @@ import logging
 from difflib import get_close_matches
 from werkzeug.utils import secure_filename
 from flask import Flask, render_template_string, request, jsonify, send_file, session
-import pandas as pd
-try:
-    import PyPDF2 as pdf_lib
-    PDF_LIB = 'pypdf2'
-except ImportError:
-    try:
-        import fitz
-        PDF_LIB = 'pymupdf'
-    except ImportError:
-        PDF_LIB = None
+import PyPDF2
+import openpyxl
 
 app = Flask(__name__)
 app.secret_key = os.environ.get('SECRET_KEY', 'change-this-in-production')
@@ -33,7 +25,7 @@ logging.basicConfig(level=logging.INFO)
 def safe_filename(filename):
     return secure_filename(filename)
 
-def validate_pdf_pypdf2(file_path):
+def validate_pdf(file_path):
     try:
         with open(file_path, 'rb') as file:
             reader = PyPDF2.PdfReader(file)
@@ -45,22 +37,17 @@ def validate_pdf_pypdf2(file_path):
     except:
         return False
 
-def validate_pdf_pymupdf(file_path):
+def read_excel(file_path):
     try:
-        doc = fitz.open(file_path)
-        has_text = any(page.get_text().strip() for page in doc)
-        doc.close()
-        return has_text
+        workbook = openpyxl.load_workbook(file_path)
+        sheet = workbook.active
+        data = []
+        for row in sheet.iter_rows(values_only=True):
+            if row[0]:  # Skip empty rows
+                data.append(row)
+        return data
     except:
-        return False
-
-def validate_pdf(file_path):
-    if PDF_LIB == 'pypdf2':
-        return validate_pdf_pypdf2(file_path)
-    elif PDF_LIB == 'pymupdf':
-        return validate_pdf_pymupdf(file_path)
-    else:
-        return False
+        return []
 
 @app.route('/')
 def index():
@@ -116,17 +103,14 @@ def statement_decision():
         categories = temp_data['categories']
         pending = temp_data['pending']
         
-        pages = list(range(statement['page_num'], statement['page_num'] + statement['total_pages']))
+        pages = [statement['page_num']]  # Simple single page processing
         
         if action == 'dnm':
             categories['dnm'].extend(pages)
         elif action == 'foreign':
             categories['foreign'].extend(pages)
         elif action == 'national':
-            if statement['total_pages'] == 1:
-                categories['national_single'].extend(pages)
-            else:
-                categories['national_multi'].extend(pages)
+            categories['national_single'].extend(pages)
                 
         pending.remove(statement)
         
@@ -171,13 +155,13 @@ def excel_processor():
         temp_path = os.path.join(tempfile.gettempdir(), safe_filename(excel_file.filename))
         excel_file.save(temp_path)
         
-        df = pd.read_excel(temp_path)
+        rows = read_excel(temp_path)
         data = []
-        for _, row in df.iterrows():
+        for row in rows:
             data.append({
-                'd': str(row.iloc[0]) if len(row) > 0 else '',
-                's': str(row.iloc[1]) if len(row) > 1 else '',
-                'w': str(row.iloc[2]) if len(row) > 2 else ''
+                'd': str(row[0]) if len(row) > 0 and row[0] else '',
+                's': str(row[1]) if len(row) > 1 and row[1] else '',
+                'w': str(row[2]) if len(row) > 2 and row[2] else ''
             })
             
         os.remove(temp_path)
@@ -193,11 +177,11 @@ def download_file(filename):
         return send_file(file_path, as_attachment=True)
     return jsonify({'error': 'File not found'}), 404
 
-def process_statements_pypdf2(pdf_path, excel_path):
-    df = pd.read_excel(excel_path)
-    company_names = df.iloc[:, 0].dropna().tolist()
+def process_statements(pdf_path, excel_path):
+    excel_data = read_excel(excel_path)
+    company_names = [str(row[0]).strip() for row in excel_data if row[0]]
     
-    categories = {'dnm': [], 'national_single': [], 'national_multi': [], 'foreign': []}
+    categories = {'dnm': [], 'national_single': [], 'foreign': []}
     pending_decisions = []
     
     start_markers = ["914.949.9618", "302.703.8961", "www.unitedcorporate.com", "AR@UNITEDCORPORATE.COM"]
@@ -209,9 +193,6 @@ def process_statements_pypdf2(pdf_path, excel_path):
         for page_num, page in enumerate(reader.pages):
             text = page.extract_text()
             
-            page_match = re.search(r'Page\s*(\d+)\s*of\s*(\d+)', text, re.IGNORECASE)
-            total_pages = int(page_match.group(2)) if page_match else 1
-            
             start_idx = min((text.find(marker) for marker in start_markers if text.find(marker) != -1), default=-1)
             end_idx = text.find(end_marker)
             
@@ -221,7 +202,7 @@ def process_statements_pypdf2(pdf_path, excel_path):
                 
                 if lines:
                     company_name = lines[0]
-                    pages = [page_num + 1]  # PyPDF2 processes page by page
+                    pages = [page_num + 1]
                     
                     if company_name in company_names:
                         categories['dnm'].extend(pages)
@@ -245,73 +226,7 @@ def process_statements_pypdf2(pdf_path, excel_path):
                                 
     return {'categories': categories, 'pending_decisions': pending_decisions}
 
-def process_statements_pymupdf(pdf_path, excel_path):
-    df = pd.read_excel(excel_path)
-    company_names = df.iloc[:, 0].dropna().tolist()
-    
-    doc = fitz.open(pdf_path)
-    categories = {'dnm': [], 'national_single': [], 'national_multi': [], 'foreign': []}
-    pending_decisions = []
-    
-    start_markers = ["914.949.9618", "302.703.8961", "www.unitedcorporate.com", "AR@UNITEDCORPORATE.COM"]
-    end_marker = "STATEMENT OF OPEN INVOICE(S)"
-    
-    page_num = 0
-    while page_num < len(doc):
-        page = doc.load_page(page_num)
-        text = page.get_text()
-        
-        page_match = re.search(r'Page\s*(\d+)\s*of\s*(\d+)', text, re.IGNORECASE)
-        total_pages = int(page_match.group(2)) if page_match else 1
-        
-        start_idx = min((text.find(marker) for marker in start_markers if text.find(marker) != -1), default=-1)
-        end_idx = text.find(end_marker)
-        
-        if start_idx != -1 and end_idx != -1 and start_idx < end_idx:
-            extracted_text = text[start_idx:end_idx].strip()
-            lines = [line.strip() for line in extracted_text.splitlines() if line.strip()]
-            
-            if lines:
-                company_name = lines[0]
-                pages = list(range(page_num + 1, page_num + 1 + total_pages))
-                
-                if company_name in company_names:
-                    categories['dnm'].extend(pages)
-                else:
-                    close_matches = get_close_matches(company_name, company_names, n=1, cutoff=0.8)
-                    if close_matches:
-                        pending_decisions.append({
-                            'page_num': page_num + 1,
-                            'company_name': company_name,
-                            'close_match': close_matches[0],
-                            'total_pages': total_pages,
-                            'lines': lines[:5]
-                        })
-                    else:
-                        if "email" in text.lower():
-                            categories['dnm'].extend(pages)
-                        elif any(state in ' '.join(lines[1:]) for state in US_STATES):
-                            if total_pages == 1:
-                                categories['national_single'].extend(pages)
-                            else:
-                                categories['national_multi'].extend(pages)
-                        else:
-                            categories['foreign'].extend(pages)
-                            
-        page_num += total_pages if page_match else 1
-        
-    doc.close()
-    return {'categories': categories, 'pending_decisions': pending_decisions}
-
-def process_statements(pdf_path, excel_path):
-    if PDF_LIB == 'pypdf2':
-        return process_statements_pypdf2(pdf_path, excel_path)
-    elif PDF_LIB == 'pymupdf':
-        return process_statements_pymupdf(pdf_path, excel_path)
-    else:
-        raise Exception("No PDF library available")
-
-def create_statement_pdfs_pypdf2(pdf_path, categories):
+def create_statement_pdfs(pdf_path, categories):
     files = []
     
     with open(pdf_path, 'rb') as file:
@@ -333,36 +248,7 @@ def create_statement_pdfs_pypdf2(pdf_path, categories):
                     
     return files
 
-def create_statement_pdfs_pymupdf(pdf_path, categories):
-    doc = fitz.open(pdf_path)
-    files = []
-    
-    for name, pages in categories.items():
-        if pages:
-            output_doc = fitz.open()
-            for page_num in sorted(set(pages)):
-                if 0 <= page_num - 1 < len(doc):
-                    output_doc.insert_pdf(doc, from_page=page_num-1, to_page=page_num-1)
-                    
-            if output_doc.page_count > 0:
-                filename = f"{name}.pdf"
-                file_path = os.path.join(RESULTS_FOLDER, filename)
-                output_doc.save(file_path)
-                files.append(filename)
-            output_doc.close()
-            
-    doc.close()
-    return files
-
-def create_statement_pdfs(pdf_path, categories):
-    if PDF_LIB == 'pypdf2':
-        return create_statement_pdfs_pypdf2(pdf_path, categories)
-    elif PDF_LIB == 'pymupdf':
-        return create_statement_pdfs_pymupdf(pdf_path, categories)
-    else:
-        raise Exception("No PDF library available")
-
-def extract_invoices_pypdf2(pdf_path):
+def extract_invoices(pdf_path):
     pattern = r'\b[PR]\d{6,8}\b'
     invoices = {}
     
@@ -380,33 +266,7 @@ def extract_invoices_pypdf2(pdf_path):
                 
     return invoices
 
-def extract_invoices_pymupdf(pdf_path):
-    doc = fitz.open(pdf_path)
-    pattern = r'\b[PR]\d{6,8}\b'
-    invoices = {}
-    
-    for page_num in range(len(doc)):
-        page = doc.load_page(page_num)
-        text = page.get_text()
-        invoice_numbers = re.findall(pattern, text)
-        
-        for invoice_number in invoice_numbers:
-            if invoice_number not in invoices:
-                invoices[invoice_number] = []
-            invoices[invoice_number].append(page_num)
-            
-    doc.close()
-    return invoices
-
-def extract_invoices(pdf_path):
-    if PDF_LIB == 'pypdf2':
-        return extract_invoices_pypdf2(pdf_path)
-    elif PDF_LIB == 'pymupdf':
-        return extract_invoices_pymupdf(pdf_path)
-    else:
-        raise Exception("No PDF library available")
-
-def create_invoice_zip_pypdf2(pdf_path, invoices):
+def create_invoice_zip(pdf_path, invoices):
     zip_path = os.path.join(RESULTS_FOLDER, 'invoices.zip')
     
     with open(pdf_path, 'rb') as file:
@@ -426,34 +286,6 @@ def create_invoice_zip_pypdf2(pdf_path, invoices):
                     os.remove(temp_path)
                     
     return zip_path
-
-def create_invoice_zip_pymupdf(pdf_path, invoices):
-    doc = fitz.open(pdf_path)
-    zip_path = os.path.join(RESULTS_FOLDER, 'invoices.zip')
-    
-    with zipfile.ZipFile(zip_path, 'w') as zipf:
-        for invoice_number, pages in invoices.items():
-            output_doc = fitz.open()
-            for page_num in pages:
-                output_doc.insert_pdf(doc, from_page=page_num, to_page=page_num)
-                
-            if output_doc.page_count > 0:
-                temp_path = f"/tmp/{invoice_number}.pdf"
-                output_doc.save(temp_path)
-                zipf.write(temp_path, f"{invoice_number}.pdf")
-                os.remove(temp_path)
-            output_doc.close()
-            
-    doc.close()
-    return zip_path
-
-def create_invoice_zip(pdf_path, invoices):
-    if PDF_LIB == 'pypdf2':
-        return create_invoice_zip_pypdf2(pdf_path, invoices)
-    elif PDF_LIB == 'pymupdf':
-        return create_invoice_zip_pymupdf(pdf_path, invoices)
-    else:
-        raise Exception("No PDF library available")
 
 HOME_TEMPLATE = '''
 <!DOCTYPE html>
@@ -516,7 +348,7 @@ HOME_TEMPLATE = '''
                 <h3>📋 Statement Separator</h3>
                 <p>Upload PDF statements and Excel DNM list to automatically categorize by location and mailing preferences.</p>
                 <div class="upload-area" id="stmt-upload">
-                    <p>Drop files here or click to select</p>
+                    <p>Drop files here or click to select PDF then Excel</p>
                     <input type="file" id="stmt-pdf" accept=".pdf" style="display:none">
                     <input type="file" id="stmt-excel" accept=".xlsx,.xls" style="display:none">
                     <div class="file-info" id="stmt-files"></div>
@@ -560,20 +392,15 @@ HOME_TEMPLATE = '''
             const uploadArea = document.getElementById(uploadId);
             const btn = document.getElementById(btnId);
             const fileInfo = document.getElementById(fileInfoId);
+            let currentInputIndex = 0;
             
             uploadArea.addEventListener('click', () => {
                 if (inputIds.length === 1) {
                     document.getElementById(inputIds[0]).click();
                 } else {
-                    // For multiple files, cycle through them
-                    let currentInput = 0;
-                    const clickNext = () => {
-                        if (currentInput < inputIds.length) {
-                            document.getElementById(inputIds[currentInput]).click();
-                            currentInput++;
-                        }
-                    };
-                    clickNext();
+                    // For statement separator - click PDF first, then Excel
+                    document.getElementById(inputIds[currentInputIndex]).click();
+                    currentInputIndex = (currentInputIndex + 1) % inputIds.length;
                 }
             });
             
@@ -598,7 +425,14 @@ HOME_TEMPLATE = '''
             uploadArea.addEventListener('drop', (e) => {
                 const files = e.dataTransfer.files;
                 if (files.length > 0) {
-                    document.getElementById(inputIds[0]).files = files;
+                    if (inputIds.length === 1) {
+                        document.getElementById(inputIds[0]).files = files;
+                    } else {
+                        // For statement separator, assign first file to PDF input
+                        const dt = new DataTransfer();
+                        dt.items.add(files[0]);
+                        document.getElementById(inputIds[0]).files = dt.files;
+                    }
                     updateFileInfo(inputIds, fileInfo, btn);
                 }
             });
@@ -618,12 +452,17 @@ HOME_TEMPLATE = '''
             if (inputIds.length === 1 && files.length > 0) {
                 fileInfo.textContent = files[0];
                 btn.disabled = false;
-            } else if (inputIds.length === 2 && files.length === 2) {
-                fileInfo.textContent = files.join(', ');
-                btn.disabled = false;
-            } else {
-                fileInfo.textContent = files.join(', ') + (inputIds.length === 2 && files.length === 1 ? ' (need both PDF and Excel)' : '');
-                btn.disabled = inputIds.length === 2 ? files.length !== 2 : files.length === 0;
+            } else if (inputIds.length === 2) {
+                if (files.length === 2) {
+                    fileInfo.textContent = `PDF: ${files[0]}, Excel: ${files[1]}`;
+                    btn.disabled = false;
+                } else if (files.length === 1) {
+                    fileInfo.textContent = `${files[0]} (need both PDF and Excel)`;
+                    btn.disabled = true;
+                } else {
+                    fileInfo.textContent = 'Select PDF and Excel files';
+                    btn.disabled = true;
+                }
             }
         }
         
@@ -686,7 +525,6 @@ HOME_TEMPLATE = '''
                 panel.innerHTML = `
                     <h4>Statement ${index + 1}: "${decision.company_name}"</h4>
                     <p><strong>Suggested match:</strong> ${decision.close_match}</p>
-                    <p><strong>Pages:</strong> ${decision.total_pages}</p>
                     <div class="decision-buttons">
                         <button class="btn-dnm" onclick="makeDecision(${index}, 'dnm')">DNM List</button>
                         <button class="btn-national" onclick="makeDecision(${index}, 'national')">National</button>
